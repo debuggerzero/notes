@@ -194,6 +194,8 @@ SpringData 是 Spring 中数据操作的模块，包含对各种数据库的集�
 - 支持基于引 JDK、JSON、字符串、Spring 对象的数据序列化及反序列化
 - 支持基于 Redis 的 JDKCollection 实现
 
+### Spring Data Redis 使用步骤
+
 1. **引入依赖**
 
 ```xml
@@ -240,4 +242,78 @@ class RedisDemoApplicationTests {
     }
 }
 ```
+
+### Spring Data Redis 的序列化方式
+
+#### **方法一**：
+
+1. 自定义 RedisTemplate
+2. 修改 RedisTemplate 的序列化器
+
+```java
+@Configuration
+@RequiredArgsConstructor
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<Object, Object> redisTemplate(RedisConnectionFactory factory) {
+        // 创建 RedisTemplate 对象
+        RedisTemplate<Object, Object> template = new RedisTemplate<>();
+		// 设置连接工厂
+        template.setConnectionFactory(factory);
+        // 配置 序列化方式
+        StringRedisSerializer stringRedisSerializer = new StringRedisSerializer();
+		// 设置序列化
+        template.setKeySerializer(stringRedisSerializer);
+        template.setValueSerializer(stringRedisSerializer);
+        template.setHashKeySerializer(stringRedisSerializer);
+        template.setHashValueSerializer(stringRedisSerializer);
+        // 返回
+        return template;
+    }
+}
+```
+
+#### 方法二：
+
+1. 使用 StringRedisTemplate
+2. 写入 Redis 时，手动把对象序列化为 JSON
+3. 读取 Redis 时，手动把读取到的 JSON 反序列化为对象
+
+## 实操——黑马点评
+
+- **常用正则表达式**
+
+```java
+public abstract class RegexPatterns {
+    
+    /**
+     * 手机号正则
+     */
+    public static final String PHONE_REGEX = "^1([38][0-9]|4[579]|5[0-3,5-9]|6[6]|7[0135678]|9[89])\\d{8}$";
+    
+    /**
+     * 邮箱正则
+     */
+    public static final String EMAIL_REGEX = "^[a-zA-Z0-9_-]+@[a-zA-Z0-9_-]+(\\.[a-zA-Z0-9_-]+)+$";
+    
+    /**
+     * 密码正则。4~32位的字母、数字、下划线
+     */
+    public static final String PASSWORD_REGEX = "^\\w{4,32}$";
+    
+    /**
+     * 验证码正则, 6位数字或字母
+     */
+    public static final String VERIFY_CODE_REGEX = "^[a-zA-Z\\d]{6}$";
+
+}
+```
+
+### 短信登录 - Session 实现
+
+
+
+
+
+
 
