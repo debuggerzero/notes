@@ -1,4 +1,4 @@
-# Redis
+#  Redis
 
 ## 初始 Redis
 
@@ -352,7 +352,7 @@ Session 的替代方案应该满足：
     - 额外的内存小号
     - 可能造成短期的不一致
 
-![image-20230816140858987](Redis.assets\image-20230816140858987.png)
+![image-20230816140858987.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230816140858987.png)
 
 - 布隆过滤
   - 优点：内存占用比较少，没有多余 key
@@ -360,7 +360,7 @@ Session 的替代方案应该满足：
     - 实现复杂
     - 存在误判可能
 
-![image-20230816141016882](Redis.assets\image-20230816141016882.png)
+![image-20230816141016882.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230816141016882.png)
 
 - 增强 id 的复杂度，避免被猜测 id 规律
 - 做好数据的基础格式校验
@@ -372,7 +372,7 @@ Session 的替代方案应该满足：
 
 **缓存雪崩**是指在同一时段大量的缓存 key 同时失效或者 Redis 服务宕机，导致大量请求到达数据库，带来巨大压力。
 
-![image-20230816144843223](Redis.assets\image-20230816144843223.png)
+![image-20230816144909103.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230816144909103.png)
 
 **解决方案**：
 
@@ -389,14 +389,483 @@ Session 的替代方案应该满足：
 
 - 互斥锁
 
-![image-20230816150353223](Redis.assets\image-20230816150353223.png)
+![image-20230816150353223.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230816150353223.png)
 
 - 逻辑过期
 
-![image-20230816150753259](E:\Notes\Redis.assets\image-20230816150753259.png)
+![image-20230816150753259.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230816150753259.png)
 
 | 解决方法 | 优点                                           | 缺点                                         |
 | -------- | ---------------------------------------------- | -------------------------------------------- |
 | 互斥锁   | 没有额外的内存消耗<br/>保证一致性<br/>实现简单 | 线程需要等待，性能受影响<br/>可能有死锁风险  |
 | 逻辑过期 | 线程无需等待                                   | 不保证一致性<br/>有额外内存消耗<br/>实现复杂 |
 
+### 封装 Redis 工具类
+
+```java
+@Slf4j
+@Component
+public class CacheClient {
+
+    private final StringRedisTemplate stringRedisTemplate;
+
+    private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+
+    public CacheClient(StringRedisTemplate stringRedisTemplate) {
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+    public void set(String key, Object value, Long time, TimeUnit unit) {
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(value), time, unit);
+    }
+
+    public void setWithLogicalExpire(String key, Object value, Long time, TimeUnit unit) {
+        // 设置逻辑过期
+        RedisData redisData = new RedisData();
+        redisData.setData(value);
+        redisData.setExpireTime(LocalDateTime.now().plusSeconds(unit.toSeconds(time)));
+        // 写入 Redis
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
+    }
+
+    public <R,ID> R queryWithPassThrough(
+            String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit){
+        String key = keyPrefix + id;
+        // 1.从 redis 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        // 2.判断是否存在
+        if (StrUtil.isNotBlank(json)) {
+            // 3.存在，直接返回
+            return JSONUtil.toBean(json, type);
+        }
+        // 判断命中的是否是空值
+        if (json != null) {
+            // 返回一个错误信息
+            return null;
+        }
+
+        // 4.不存在，根据 id 查询数据库
+        R r = dbFallback.apply(id);
+        // 5.不存在，返回错误
+        if (r == null) {
+            // 将空值写入 redis
+            stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+            // 返回错误信息
+            return null;
+        }
+        // 6.存在，写入 redis
+        this.set(key, r, time, unit);
+        return r;
+    }
+
+    public <R, ID> R queryWithLogicalExpire(
+            String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
+        String key = keyPrefix + id;
+        // 1.从 redis 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        // 2.判断是否存在
+        if (StrUtil.isBlank(json)) {
+            // 3.存在，直接返回
+            return null;
+        }
+        // 4.命中，需要先把 json 反序列化为对象
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        R r = JSONUtil.toBean((JSONObject) redisData.getData(), type);
+        LocalDateTime expireTime = redisData.getExpireTime();
+        // 5.判断是否过期
+        if(expireTime.isAfter(LocalDateTime.now())) {
+            // 5.1.未过期，直接返回信息
+            return r;
+        }
+        // 5.2.已过期，需要缓存重建
+        // 6.缓存重建
+        // 6.1.获取互斥锁
+        String lockKey = LOCK_SHOP_KEY + id;
+        boolean isLock = tryLock(lockKey);
+        // 6.2.判断是否获取锁成功
+        if (isLock){
+            // 6.3.成功，开启独立线程，实现缓存重建
+            CACHE_REBUILD_EXECUTOR.submit(() -> {
+                try {
+                    // 查询数据库
+                    R newR = dbFallback.apply(id);
+                    // 重建缓存
+                    this.setWithLogicalExpire(key, newR, time, unit);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }finally {
+                    // 释放锁
+                    unlock(lockKey);
+                }
+            });
+        }
+        // 6.4.返回过期的商铺信息
+        return r;
+    }
+
+    public <R, ID> R queryWithMutex(
+            String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
+        String key = keyPrefix + id;
+        // 1.从 redis 查询缓存
+        String shopJson = stringRedisTemplate.opsForValue().get(key);
+        // 2.判断是否存在
+        if (StrUtil.isNotBlank(shopJson)) {
+            // 3.存在，直接返回
+            return JSONUtil.toBean(shopJson, type);
+        }
+        // 判断命中的是否是空值
+        if (shopJson != null) {
+            // 返回一个错误信息
+            return null;
+        }
+
+        // 4.实现缓存重建
+        // 4.1.获取互斥锁
+        String lockKey = LOCK_SHOP_KEY + id;
+        R r = null;
+        try {
+            boolean isLock = tryLock(lockKey);
+            // 4.2.判断是否获取成功
+            if (!isLock) {
+                // 4.3.获取锁失败，休眠并重试
+                Thread.sleep(50);
+                return queryWithMutex(keyPrefix, id, type, dbFallback, time, unit);
+            }
+            // 4.4.获取锁成功，根据 id 查询数据库
+            r = dbFallback.apply(id);
+            // 5.不存在，返回错误
+            if (r == null) {
+                // 将空值写入 redis
+                stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+                // 返回错误信息
+                return null;
+            }
+            // 6.存在，写入 redis
+            this.set(key, r, time, unit);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }finally {
+            // 7.释放锁
+            unlock(lockKey);
+        }
+        // 8.返回
+        return r;
+    }
+
+    private boolean tryLock(String key) {
+        Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
+        return BooleanUtil.isTrue(flag);
+    }
+
+    private void unlock(String key) {
+        stringRedisTemplate.delete(key);
+    }
+}
+```
+
+### 全局 ID 生成器
+
+为了增加 ID 的安全性，我们可以不直接使用 Redis 自增的数值，而是拼接一些其他的信息。
+
+- UUID
+- Redis 自增
+- snowflake 算法
+- 数据库自增
+
+```java
+@Component
+public class RedisIdWorker {
+    
+    /**
+     * 开始时间戳
+     */
+    private static final long BEGIN_TIMESTAMP = 1640995200L;
+    
+    /**
+     * 序列号的位数
+     */
+    private static final int COUNT_BITS = 32;
+
+    private StringRedisTemplate stringRedisTemplate;
+
+    public RedisIdWorker(StringRedisTemplate stringRedisTemplate) {
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+    public long nextId(String keyPrefix) {
+        // 1.生成时间戳
+        LocalDateTime now = LocalDateTime.now();
+        long nowSecond = now.toEpochSecond(ZoneOffset.UTC);
+        long timestamp = nowSecond - BEGIN_TIMESTAMP;
+
+        // 2.生成序列号
+        // 2.1.获取当前日期，精确到天
+        String date = now.format(DateTimeFormatter.ofPattern("yyyy:MM:dd"));
+        // 2.2.自增长
+        long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + date);
+
+        // 3.拼接并返回
+        return timestamp << COUNT_BITS | count;
+    }
+}
+```
+
+### 悲观锁
+
+认为线程安全问题一定会发生，因此在操作数据之前先获取锁，确保线程串行执行。
+
+- 例如 Synchronized，Lock 都属于悲观锁
+
+优点：简单粗暴
+
+缺点：性能一般
+
+### 乐观锁
+
+认为线程安全不一定发生，因此不加锁，只是在更新数据时去判断有没有其他线程对数据做了修改。
+
+- 如果没有修改则认为是安全的，自己才更新数据。
+- 如果已经被其他线程修改说明发生了安全问题，此时可以重试或异常。
+
+#### 常见方式
+
+乐观锁的关键是判断之前查询得到的数据是否有被修改过
+
+- 版本号法
+- CAS 法
+
+优点：性能好
+
+缺点：存在成功率低的问题
+
+## 分布式锁
+
+**分布式锁**：满足分布式系统或集群模式下多进程可见并且互斥的锁
+
+- 多进程可见
+- 互斥
+- 高可用
+- 高性能
+- 安全性
+
+### 分布式锁的实现
+
+分布式锁的核心是实现多进程之间互斥，而满足这一点的方式有很多，常见的有：
+
+|        | MySQL                       | Redis                     | Zookeeper                        |
+| ------ | --------------------------- | ------------------------- | -------------------------------- |
+| 互斥   | 利用 mysql 本身的互斥锁机制 | 利用 setnx 这样的互斥命令 | 利用结点的唯一性和有序性实现互斥 |
+| 高可用 | 好                          | 好                        | 好                               |
+| 高性能 | 一般                        | 好                        | 一般                             |
+| 安全性 | 断开连接，自动释放锁        | 利用锁超时时间，到期释放  | 临时结点，断开连接自动释放       |
+
+### 基于 Redis 的分布式锁
+
+实现分布式锁时需要实验的两个基本方法：
+
+- 获取锁：
+
+  - 互斥：确保只能有一个线程获取锁
+  - 非阻塞：尝试一次，成功返回 true，失败返回 false
+
+```shell
+# 添加锁，NX 互斥，EX 是设置超时时间
+SET lock thread1 NX EX 10
+```
+
+- 释放锁：
+
+  - 手动释放
+  - 超时释放
+
+```shell
+# 释放锁，删除即可
+DEL key
+```
+
+#### 分布式锁误删情况解决方法
+
+1. 在获取锁时存入线程标识（可以用 UUID 表示）
+2. 在释放锁时现获取锁中的线程标识，判断是否与当前线程标识一致
+   1. 如果一致则释放锁
+   2. 如果不一致则不释放锁
+
+##### Redis 的 Lua 脚本
+
+Redis  提供了 Lua 脚本功能，在一个脚本中编写多条 Redis 命令，确保多条命令执行时的原子性。
+
+```shell
+# 执行 redis 命令
+redis.call('命令名称', 'key', '其他参数', ....)
+
+# 调用 例：
+eval "return redis.call(('set', KEYS[1], ARGV[1], ....)" 1 name hwc
+```
+
+释放锁的业务流程：
+
+1. 获取锁种的线程标识
+2. 判断是否与指定的标识（当前线程标识）一致
+3. 如果一直则释放锁（删除）
+4. 如果不一致则什么都不做
+
+```lua
+-- 获取锁中的线程标识 get key
+local id = redis.call('get', KEYS[1])
+-- 比较线程标识与锁中的标识是否一致
+if (id == ARGV[1]) then 
+    -- 释放锁 del key
+    return redis.call('del', KEYS[1])
+end
+return 
+```
+
+### 基于 Redis 的分布式锁优化
+
+1. 不可重入：同一个线程无法多次获取同一把锁
+2. 不可重试：获取锁只尝试一次就返回 false，没有重试机制
+3. 超时释放：锁超时释放虽然可以避免死锁，但如果是业务执行耗时较长，也会导致锁释放，存在安全隐患
+4. 主从一致性：如果 Redis 提供了主从集群，主从同步存在延迟，当主宕机时，如果从并同步主中锁数据，则会出现锁实现
+
+### Redisson
+
+Redisson 是一个在 Redis 的基础上实现的 Java 驻内存数据网络。他不仅提供了一系列的分布式的 Java 常用对象，还提供了许多分布式服务，其中就包含了各种分布式锁的实现。
+
+#### Redisson 入门
+
+1. 引入依赖
+
+```xml
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson</artifactId>
+    <version>3.13.6</version>
+</dependency>
+```
+
+2. 配置 Redisson 客户端
+
+```java
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedissonClient redissonClient() {
+        // 配置类
+        Config config = new Config();
+        // 添加 redis 地址，这里添加了单点的地址，也可以使用 config.useClusterServers() 添加集群地址
+        config.useSingleServer().setAddress("redis://ip:port").setPassword(password);
+        // 创建客户端
+        return Redisson.create(config);
+    }
+}
+```
+
+3. 使用 Redisson 的分布式锁
+
+#### Redisson 可重入锁原理
+
+![image-20230924214632899.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230924214632899.png)****
+
+- 注意：
+  1. 所有的判断和操作都需要使用 Lua 脚本来保证原子性
+  2. 每次获取和释放锁时要重置锁的有效期，就像新抢到锁一样，给业务充分的执行时间
+
+- 获取锁的 Lua 脚本：
+
+```lua
+local key = KEYS[1];			-- 锁的 key
+local threadId = ARGV[1];		-- 线程唯一标识
+local releaseTime = ARGV[2];	-- 锁的自动释放时间
+-- 判断是否存在
+if (redis.call('exists', key) == 0) the
+    -- 不存在，获取锁
+    redis.call('hset', key, threadId, '1');
+    -- 设置有效期
+    redis.call('expire', key, releaseTime);
+    return 1;	-- 返回结果
+end;
+-- 锁已经存在，判断 threadId 是否是自己
+if (redis.call('hexists', key, threadId) == 1) then 
+    -- 不存在，获取锁，重入次数 + 1
+    redis.call('hincrby', key, threadId, '1');
+    -- 设置有效期
+    redis.call('expire', key, releaseTime);
+    return 1;
+end;
+return 0; -- 代码走到这里，说明获取锁不是自己，获取锁失败
+```
+
+- 释放锁的 Lua 脚本
+
+```lua
+local key = KEYS[1];			-- 锁的 key
+local threadId = ARGV[1];		-- 线程唯一标识
+local releaseTime = ARGV[2];	-- 锁的自动释放时间
+-- 判断当前锁是否还是被自己持有
+if (redis.call('hexists', key, threadId) == 0) then
+    return nil;		-- 如果已经不是自己，则直接返回
+end;
+-- 是自己的锁，则重入次数 -1
+local count = redis.call('hincrby', key, threadId, -1);
+-- 判断是否重入次数是否已经为 0
+if (count > 0) then
+    -- 大于 0 说明不能释放锁，重置有效期然后返回
+    redis.call('expire', key, releaseTime);
+    return nil;
+else 
+    redis.call('del', key);
+    return nil;
+end;
+```
+
+#### **如何重试获取锁？**
+
+**基于 redis Pub / Sub 发布订阅机制。**如果获取锁失败，则阻塞订阅释放锁的消息；当锁被释放时，会触发推送（告诉其他线程我释放锁了），然后其他线程在重试获取；如此往复，直到超时。
+
+#### **如何防止锁提前超时释放？**
+
+**基于看门狗机制**。如果不手动设置锁释放时间（leaseTime)，默认设置 30 秒过期，并且给当前锁注册一个定时任务，该定时任务每隔 1 / 3 的锁释放时间（一般是 10 秒）会重置锁的过期时间（递归调用，一次续期完了再）。
+
+1. 如何保证同一个锁只注册一个定时任务？
+2. 如何防止无限续期？
+
+要解决这些问题，使用全局 ConcurrentHashMap 来管理所 => 任务消息，key 为锁的 id，从而保证唯一。当某个锁释放时，从全局 ConcurrentHashMap 中取出定时任务并取消掉，然后把锁的信息从 Map 中删除即可。
+
+**Redisson 分布式锁原理**
+
+![image-20230925201106673.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230925201106673.png)
+
+#### Redisson 分布式锁主从一致性问题
+
+![image-20230925201915720.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230925201915720.png)
+
+如果使用主从复制的 Redis 集群，可能出现主从结点设置的锁状态不一致的问题。
+
+可以使用 Redisson 的 MultiLock （联锁）来解决，核心思想是开启多个独立的 Redis 主节点，设置锁是必须在所有主节点都写入成功，才算设置成功。
+
+这样做之后，哪怕有部分结点挂掉，其他线程也无法 setnx 全部成功，就不会出现重复执行业务的情况。
+
+如下图：
+
+![image-20230925203258255.png](https://zero-img-1314223587.cos.ap-shanghai.myqcloud.com/zero/image-20230925203258255.png)
+
+实现 MultiLock 的几个关键：
+
+1. 遍历所有节点，依次设置锁，并使用列表来记录所有主节点的锁是否设置成功。
+2. 只要有一个节点设置不成功，就要释放所有的锁，从头来过。
+3. 因为不同节点设置锁成功的时间不同，所以在所有锁设置成功后，要统一设置过期时间（但如果 leaseTime = -1 就不用了，因为开启了看门狗机制会自动续期)。
+4. 锁释放时间（leaseTime）必须要大于抢锁最大等待时间（waitTime），否则可能出现第一个节点抢到锁，最后一个节点还没抢到锁，之前的锁就已经超时释放了。所以如果指定了 waitTime 和 leaseTime，默认 leaseTime = waitTime * 2。
+
+MulitLock 最安全，但同样会带来很大的运维成本。
+
+### 小结
+
+1. **不可重入 Redis 分布式锁：**
+   - 原理：利用 setnx 的互斥性；利用 ex 避免死锁；释放锁时判断线程标识
+   - 缺陷：不可重入、无法重试、锁超时失效
+2. **可重入的 Redis 分布式锁：**
+   - 原理：利用 hash 结构，记录线程标识和重入次数；利用 watchDog 延续所时间；利用信号量控制锁重试等待
+   - 缺陷：redis 宕机引起锁失效问题
+3. **Redisson 的 multiLock：**
+   - 原理：多个独立的 Redis 结点，必须在所有结点都获取重入锁，才算获取锁成功
+   - 缺陷：运维成本高、实现复杂
